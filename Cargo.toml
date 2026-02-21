@@ -1,0 +1,10 @@
+[package]
+name = "ketama"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ringline-rs/ketama"
+description = "Ketama consistent hash ring compatible with libmemcached/twemproxy"
+readme = "README.md"
+keywords = ["ketama", "consistent-hashing", "hash-ring", "sharding"]
+categories = ["algorithms", "network-programming"]
