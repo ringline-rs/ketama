@@ -75,13 +75,35 @@ impl RingBuilder {
     /// # Panics
     ///
     /// Panics if no nodes were added.
+    ///
+    /// Panics if more than `u16::MAX` nodes were added. Shard indices are
+    /// stored as `u16`, so beyond that they wrap: with 65538 nodes,
+    /// [`Ring::node_count`] reported 2 while [`Ring::route`] returned indices
+    /// up to 65534, and a caller indexing by the returned shard would read out
+    /// of bounds.
+    ///
+    /// Panics if every node has weight 0. That produces a ring with no points,
+    /// which used to build successfully and then panic inside
+    /// [`Ring::route`] -- deferring a configuration error to request time.
+    ///
+    /// Panics if a node's virtual-point count overflows `usize`, which can
+    /// happen on 32-bit targets for large weights.
     pub fn build(self) -> Ring {
         assert!(!self.nodes.is_empty(), "Ring must have at least one node");
+        assert!(
+            self.nodes.len() <= u16::MAX as usize,
+            "Ring supports at most {} nodes, got {}: shard indices are stored as u16 \
+             and would wrap, silently misrouting keys",
+            u16::MAX,
+            self.nodes.len()
+        );
 
         let mut points = Vec::new();
 
         for (shard_idx, (identity, weight)) in self.nodes.iter().enumerate() {
-            let num_points = 160 * (*weight as usize);
+            let num_points = 160usize.checked_mul(*weight as usize).unwrap_or_else(|| {
+                panic!("node {identity:?} weight {weight} overflows the virtual-point count")
+            });
             // Each MD5 digest yields 4 hash points
             let num_hashes = num_points / 4;
 
@@ -101,6 +123,11 @@ impl RingBuilder {
                 }
             }
         }
+
+        assert!(
+            !points.is_empty(),
+            "Ring has no virtual points: every node has weight 0, so no key could be routed"
+        );
 
         points.sort_unstable_by_key(|&(hash, _)| hash);
 
@@ -127,6 +154,54 @@ fn key_hash(key: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "every node has weight 0")]
+    fn all_zero_weights_fail_at_build_not_at_route() {
+        // This used to build a ring with zero points, and then panic with an
+        // index-out-of-bounds inside route() -- deferring a configuration
+        // error to request time.
+        let _ = RingBuilder::new().node("a", 0).node("b", 0).build();
+    }
+
+    #[test]
+    fn zero_weight_node_alongside_weighted_nodes_is_allowed() {
+        // Weight 0 remains a valid way to park a single node: it takes no
+        // points, but the ring is still routable.
+        let ring = RingBuilder::new().node("a", 1).node("b", 0).build();
+        assert_eq!(ring.node_count(), 2);
+        for i in 0..100 {
+            assert_eq!(ring.route(format!("k{i}").as_bytes()), 0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 65535 nodes")]
+    fn more_than_u16_max_nodes_is_rejected() {
+        // Shard indices are stored as u16. With 65538 nodes, node_count()
+        // reported 2 while route() returned indices up to 65534, so a caller
+        // indexing by the returned shard read out of bounds.
+        let mut builder = RingBuilder::new();
+        for i in 0..=(u16::MAX as usize + 1) {
+            builder = builder.node(&format!("s{i}"), 1);
+        }
+        let _ = builder.build();
+    }
+
+    // Builds 65535 nodes x 40 MD5 digests, which takes ~30s in a debug build
+    // against a 0.07s suite. The rejection test above is the one that guards
+    // the bug; this pins the boundary as inclusive and is available on demand:
+    //   cargo test --release -- --ignored
+    #[test]
+    #[ignore = "slow: hashes 2.6M virtual points"]
+    fn exactly_u16_max_nodes_is_allowed() {
+        let mut builder = RingBuilder::new();
+        for i in 0..u16::MAX as usize {
+            builder = builder.node(&format!("s{i}"), 1);
+        }
+        let ring = builder.build();
+        assert_eq!(ring.node_count(), u16::MAX as usize);
+    }
 
     #[test]
     fn single_node_always_zero() {
