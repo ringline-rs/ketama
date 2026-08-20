@@ -39,7 +39,10 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
     // Process each 512-bit (64-byte) chunk
-    for chunk in msg.chunks_exact(64) {
+    // `as_chunks` rather than `chunks_exact`: it yields `&[u8; 64]`, so the
+    // indexing below is bounds-checked once per chunk instead of per access,
+    // and clippy 1.98 flags the `chunks_exact` form for exactly this reason.
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             let off = i * 4;

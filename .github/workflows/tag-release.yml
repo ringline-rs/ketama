@@ -9,10 +9,11 @@ env:
 
 jobs:
   tag-release:
-    name: Tag release and bump dev version
+    name: Tag release
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     if: "startsWith(github.event.head_commit.message, 'release: v')"
 
     steps:
@@ -26,61 +27,101 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Extract version
-        id: version
+      - name: Parse release version
+        id: parse
+        env:
+          # Pass the commit message through the environment, NOT by
+          # interpolating ${{ }} into the script body. GitHub substitutes
+          # ${{ }} as raw text before the shell runs, so a release body
+          # containing backticks or $(...) would be executed as shell. As an
+          # env var the value is inert data the regex matches against safely.
+          MSG: ${{ github.event.head_commit.message }}
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Detected version: $VERSION"
+          if [[ "$MSG" =~ ^release:\ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+            echo "Detected release v${BASH_REMATCH[1]}"
+          else
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            echo "Commit message does not match the release pattern, skipping"
+          fi
+
+      - name: Verify version matches Cargo.toml
+        if: steps.parse.outputs.mode != 'none'
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "ERROR: commit says v${VERSION} but Cargo.toml says ${CARGO_VERSION}"
+            exit 1
+          fi
+          echo "Version ${VERSION} matches Cargo.toml"
 
       - name: Check if tag exists
         id: check_tag
+        if: steps.parse.outputs.mode != 'none'
+        env:
+          TAG: ${{ steps.parse.outputs.tag }}
         run: |
-          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Tag v${{ steps.version.outputs.version }} already exists"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists, nothing to do"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create and push tag
-        if: steps.check_tag.outputs.exists == 'false'
+        if: steps.parse.outputs.mode != 'none' && steps.check_tag.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.parse.outputs.tag }}
         run: |
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
-          git push origin "v${{ steps.version.outputs.version }}"
-          echo "Created and pushed tag v${{ steps.version.outputs.version }}"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          echo "Created and pushed tag $TAG"
 
-      - name: Install Rust
-        if: steps.check_tag.outputs.exists == 'false'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-release
-        if: steps.check_tag.outputs.exists == 'false'
-        run: cargo install cargo-release --locked
-
-      - name: Bump to next dev version
-        if: steps.check_tag.outputs.exists == 'false'
+      - name: Open next dev version PR
+        if: steps.parse.outputs.mode != 'none' && steps.check_tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          VERSION: ${{ steps.parse.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-          NEXT_DEV="${MAJOR}.${MINOR}.$((PATCH + 1))-alpha.0"
-          echo "Bumping to next dev version: $NEXT_DEV"
+          NEXT_DEV="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          BRANCH="chore/bump-${NEXT_DEV}"
 
-          cargo release version "$NEXT_DEV" --execute --no-confirm
+          git checkout -b "$BRANCH"
 
-          git add -A
+          # Only the first `version = ` line, which is the package version.
+          # Cargo.lock is gitignored in this repo, so nothing else to refresh.
+          sed -i "0,/^version = \"${VERSION}\"/s//version = \"${NEXT_DEV}\"/" Cargo.toml
+
+          git add Cargo.toml
           git commit -m "chore: bump to ${NEXT_DEV} for next development iteration"
-          git push origin main
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "chore: bump to ${NEXT_DEV} for next development iteration" \
+            --body "Automated version bump after the v${VERSION} release." \
+            --base main \
+            --head "$BRANCH"
 
       - name: Summary
+        if: steps.parse.outputs.mode != 'none'
+        env:
+          TAG: ${{ steps.parse.outputs.tag }}
+          EXISTS: ${{ steps.check_tag.outputs.exists }}
         run: |
-          echo "## Release Tagged" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.check_tag.outputs.exists }}" == "true" ]; then
-            echo "Tag v${{ steps.version.outputs.version }} already existed, skipped." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Created tag: v${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-            echo "- Bumped to next dev version" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The release workflow will now build and publish artifacts." >> $GITHUB_STEP_SUMMARY
-          fi
+          {
+            echo "## Release tagged"
+            echo ""
+            if [ "$EXISTS" = "true" ]; then
+              echo "Tag ${TAG} already existed, skipped."
+            else
+              echo "- Created tag: ${TAG}"
+              echo "- Opened the next dev-version PR"
+              echo ""
+              echo "The release workflow will now publish to crates.io."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
