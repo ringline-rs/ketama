@@ -2,6 +2,9 @@
 name = "ketama"
 version = "0.0.2"
 edition = "2024"
+# `slice::as_chunks` (src/md5.rs) stabilized in 1.88. Edition 2024 already
+# required 1.85, so this makes an existing implicit floor explicit.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ringline-rs/ketama"
 description = "Ketama consistent hash ring compatible with libmemcached/twemproxy"
